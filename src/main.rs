@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod copilot_poller;
 mod diagnose;
 mod localization;
 mod models;

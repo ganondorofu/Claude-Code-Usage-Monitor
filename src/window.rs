@@ -18,12 +18,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
+use crate::models::{ActiveView, AppUsageData};
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COPILOT_POLL, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL,
+    TIMER_UPDATE_CHECK, WM_APP_COPILOT_UPDATED, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
-use crate::poller;
+use crate::{copilot_poller, poller};
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
@@ -78,6 +78,14 @@ struct AppState {
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
 
+    // GitHub Copilot
+    active_view: ActiveView,
+    copilot_percent: f64,
+    copilot_row1_text: String,
+    copilot_row2_text: String,
+    copilot_last_poll_ok: bool,
+    copilot_retry_count: u32,
+
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
@@ -101,6 +109,7 @@ const POLL_1_MIN: u32 = 60_000;
 const POLL_5_MIN: u32 = 300_000;
 const POLL_15_MIN: u32 = 900_000;
 const POLL_1_HOUR: u32 = 3_600_000;
+const POLL_COPILOT_MS: u32 = 300_000;
 
 // Menu item IDs for update frequency
 const IDM_FREQ_1MIN: u16 = 10;
@@ -121,6 +130,8 @@ const IDM_LANG_KOREAN: u16 = 47;
 const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
+const IDM_SWITCH_VIEW: u16 = 70;
+const IDM_COPILOT_TOKEN: u16 = 71;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -213,6 +224,8 @@ struct SettingsFile {
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
     show_codex: bool,
+    #[serde(default)]
+    active_view: u8,
 }
 
 impl Default for SettingsFile {
@@ -225,6 +238,7 @@ impl Default for SettingsFile {
             widget_visible: true,
             show_claude_code: true,
             show_codex: false,
+            active_view: 0,
         }
     }
 }
@@ -280,6 +294,7 @@ fn save_state_settings() {
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
+            active_view: match s.active_view { ActiveView::Claude => 0, ActiveView::Copilot => 1 },
         });
     }
 }
@@ -1023,6 +1038,12 @@ pub fn run() {
                 last_poll_ok: false,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
+                active_view: if settings.active_view == 1 { ActiveView::Copilot } else { ActiveView::Claude },
+                copilot_percent: 0.0,
+                copilot_row1_text: "--".to_string(),
+                copilot_row2_text: "--".to_string(),
+                copilot_last_poll_ok: false,
+                copilot_retry_count: 0,
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
@@ -1101,12 +1122,22 @@ pub fn run() {
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
 
-        // Initial poll
+        // Initial poll for Claude Code
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
         std::thread::spawn(move || {
             diagnose::log("initial poll thread started");
             do_poll(send_hwnd);
         });
+
+        // Initial poll for GitHub Copilot (slight delay to not race Claude poll)
+        let send_hwnd_copilot = SendHwnd::from_hwnd(hwnd);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            do_copilot_poll(send_hwnd_copilot);
+        });
+
+        // Copilot poll timer: 5 minutes
+        SetTimer(hwnd, TIMER_COPILOT_POLL, POLL_COPILOT_MS, None);
 
         schedule_auto_update_check(hwnd);
         let should_check_updates = {
@@ -1152,6 +1183,10 @@ fn render_layered() {
         codex_weekly_text,
         show_claude_code,
         show_codex,
+        active_view,
+        copilot_pct,
+        copilot_row1,
+        copilot_row2,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1170,6 +1205,10 @@ fn render_layered() {
                 s.codex_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
+                s.active_view,
+                s.copilot_percent,
+                s.copilot_row1_text.clone(),
+                s.copilot_row2_text.clone(),
             ),
             None => return,
         }
@@ -1260,6 +1299,10 @@ fn render_layered() {
             show_claude_code,
             show_codex,
             &codex_accent,
+            active_view,
+            copilot_pct,
+            &copilot_row1,
+            &copilot_row2,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1330,6 +1373,10 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     codex_accent: &Color,
+    active_view: ActiveView,
+    copilot_pct: f64,
+    copilot_row1: &str,
+    copilot_row2: &str,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1406,40 +1453,64 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
-        draw_row(
-            hdc,
-            content_x,
-            row1_y,
-            is_dark,
-            text_color,
-            strings.session_window,
-            session_pct,
-            session_text,
-            codex_session_pct,
-            codex_session_text,
-            show_claude_code,
-            show_codex,
-            accent,
-            codex_accent,
-            track,
-        );
-        draw_row(
-            hdc,
-            content_x,
-            row2_y,
-            is_dark,
-            text_color,
-            strings.weekly_window,
-            weekly_pct,
-            weekly_text,
-            codex_weekly_pct,
-            codex_weekly_text,
-            show_claude_code,
-            show_codex,
-            accent,
-            codex_accent,
-            track,
-        );
+        if active_view == ActiveView::Copilot {
+            let copilot_accent = Color::from_hex("#0969DA");
+            draw_row(
+                hdc,
+                content_x,
+                row1_y,
+                is_dark,
+                text_color,
+                "mo",
+                copilot_pct,
+                copilot_row1,
+                0.0,
+                "",
+                true,
+                false,
+                &copilot_accent,
+                &copilot_accent,
+                track,
+            );
+            if !copilot_row2.is_empty() {
+                draw_info_row(hdc, content_x, row2_y, copilot_row2);
+            }
+        } else {
+            draw_row(
+                hdc,
+                content_x,
+                row1_y,
+                is_dark,
+                text_color,
+                strings.session_window,
+                session_pct,
+                session_text,
+                codex_session_pct,
+                codex_session_text,
+                show_claude_code,
+                show_codex,
+                accent,
+                codex_accent,
+                track,
+            );
+            draw_row(
+                hdc,
+                content_x,
+                row2_y,
+                is_dark,
+                text_color,
+                strings.weekly_window,
+                weekly_pct,
+                weekly_text,
+                codex_weekly_pct,
+                codex_weekly_text,
+                show_claude_code,
+                show_codex,
+                accent,
+                codex_accent,
+                track,
+            );
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -1596,6 +1667,43 @@ fn do_poll(send_hwnd: SendHwnd) {
 
             unsafe {
                 let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+}
+
+fn do_copilot_poll(send_hwnd: SendHwnd) {
+    let hwnd = send_hwnd.to_hwnd();
+    match copilot_poller::poll() {
+        Ok(data) => {
+            let (pct, row1, row2) = copilot_poller::format_rows(&data);
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.copilot_percent = pct;
+                s.copilot_row1_text = row1;
+                s.copilot_row2_text = row2;
+                s.copilot_last_poll_ok = true;
+                s.copilot_retry_count = 0;
+            }
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_COPILOT_UPDATED, WPARAM(0), LPARAM(0));
+            }
+        }
+        Err(e) => {
+            let msg = match e {
+                copilot_poller::CopilotPollError::NoCredentials => "no token",
+                copilot_poller::CopilotPollError::NoPlan => "no plan",
+                copilot_poller::CopilotPollError::RequestFailed => "api err",
+            };
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.copilot_row1_text = msg.to_string();
+                s.copilot_row2_text = "--".to_string();
+                s.copilot_last_poll_ok = false;
+                s.copilot_retry_count = s.copilot_retry_count.saturating_add(1);
+            }
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_COPILOT_UPDATED, WPARAM(0), LPARAM(0));
             }
         }
     }
@@ -1945,8 +2053,18 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
+                TIMER_COPILOT_POLL => {
+                    let sh = SendHwnd::from_hwnd(hwnd);
+                    std::thread::spawn(move || {
+                        do_copilot_poll(sh);
+                    });
+                }
                 _ => {}
             }
+            LRESULT(0)
+        }
+        WM_APP_COPILOT_UPDATED => {
+            render_layered();
             LRESULT(0)
         }
         WM_APP_USAGE_UPDATED => {
@@ -2118,6 +2236,19 @@ unsafe extern "system" fn wnd_proc(
             if was_dragging.is_some() {
                 let _ = ReleaseCapture();
                 save_state_settings();
+            } else {
+                // Non-drag left-click: toggle between Claude and Copilot view
+                {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        s.active_view = match s.active_view {
+                            ActiveView::Claude => ActiveView::Copilot,
+                            ActiveView::Copilot => ActiveView::Claude,
+                        };
+                    }
+                }
+                save_state_settings();
+                render_layered();
             }
             LRESULT(0)
         }
@@ -2136,14 +2267,42 @@ unsafe extern "system" fn wnd_proc(
                             s.weekly_text = "...".to_string();
                             s.codex_session_text = "...".to_string();
                             s.codex_weekly_text = "...".to_string();
+                            s.copilot_row1_text = "...".to_string();
                             s.force_notify_auth_error = true;
                         }
                     }
                     render_layered();
                     let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
+                    let sh2 = SendHwnd::from_hwnd(hwnd);
+                    std::thread::spawn(move || { do_poll(sh); });
+                    std::thread::spawn(move || { do_copilot_poll(sh2); });
+                }
+                IDM_SWITCH_VIEW => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.active_view = match s.active_view {
+                                ActiveView::Claude => ActiveView::Copilot,
+                                ActiveView::Copilot => ActiveView::Claude,
+                            };
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
+                IDM_COPILOT_TOKEN => {
+                    if let Some(token) = show_token_dialog(hwnd) {
+                        save_github_token(&token);
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.copilot_row1_text = "...".to_string();
+                            }
+                        }
+                        render_layered();
+                        let sh = SendHwnd::from_hwnd(hwnd);
+                        std::thread::spawn(move || { do_copilot_poll(sh); });
+                    }
                 }
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
@@ -2327,6 +2486,7 @@ fn show_context_menu(hwnd: HWND) {
             widget_visible,
             show_claude_code,
             show_codex,
+            active_view,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2340,6 +2500,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.widget_visible,
                     s.show_claude_code,
                     s.show_codex,
+                    s.active_view,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2351,11 +2512,34 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     true,
                     false,
+                    ActiveView::Claude,
                 ),
             }
         };
 
         let menu = CreatePopupMenu().unwrap();
+
+        // Switch view item
+        let switch_label = match active_view {
+            ActiveView::Claude => native_interop::wide_str("Switch to GitHub Copilot"),
+            ActiveView::Copilot => native_interop::wide_str("Switch to Claude Code"),
+        };
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_SWITCH_VIEW as usize,
+            PCWSTR::from_raw(switch_label.as_ptr()),
+        );
+
+        let token_str = native_interop::wide_str("GitHub Token...");
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_COPILOT_TOKEN as usize,
+            PCWSTR::from_raw(token_str.as_ptr()),
+        );
+
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let refresh_str = native_interop::wide_str(strings.refresh);
         let _ = AppendMenuW(
@@ -2577,6 +2761,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
         codex_weekly_text,
         show_claude_code,
         show_codex,
+        active_view,
+        copilot_pct,
+        copilot_row1,
+        copilot_row2,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -2593,6 +2781,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.codex_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
+                s.active_view,
+                s.copilot_percent,
+                s.copilot_row1_text.clone(),
+                s.copilot_row2_text.clone(),
             ),
             None => return,
         }
@@ -2651,6 +2843,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_claude_code,
             show_codex,
             &codex_accent,
+            active_view,
+            copilot_pct,
+            &copilot_row1,
+            &copilot_row2,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -2844,4 +3040,131 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
     }
+}
+
+fn draw_info_row(hdc: HDC, x: i32, y: i32, text: &str) {
+    unsafe {
+        let seg_h = sc(SEGMENT_H);
+        let full_w = sc(LABEL_WIDTH)
+            + sc(LABEL_RIGHT_MARGIN)
+            + SEGMENT_COUNT * (sc(SEGMENT_W) + sc(SEGMENT_GAP))
+            - sc(SEGMENT_GAP)
+            + sc(BAR_RIGHT_MARGIN)
+            + sc(TEXT_WIDTH);
+
+        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+        let mut text_rect = RECT {
+            left: x,
+            top: y,
+            right: x + full_w,
+            bottom: y + seg_h,
+        };
+        let _ = DrawTextW(hdc, &mut text_wide, &mut text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+fn token_file_path() -> std::path::PathBuf {
+    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(appdata)
+        .join("ClaudeCodeUsageMonitor")
+        .join("github_token.txt")
+}
+
+fn save_github_token(token: &str) {
+    let path = token_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, token.trim());
+}
+
+fn build_token_dialog_template() -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::new();
+    macro_rules! dw { ($val:expr) => { v.extend_from_slice(&($val as u32).to_le_bytes()); }; }
+    macro_rules! sw { ($val:expr) => { v.extend_from_slice(&($val as i16).to_le_bytes()); }; }
+    macro_rules! w  { ($val:expr) => { v.extend_from_slice(&($val as u16).to_le_bytes()); }; }
+    macro_rules! ws { ($s:expr) => {
+        for ch in ($s as &str).encode_utf16() { v.extend_from_slice(&ch.to_le_bytes()); }
+        w!(0u16);
+    }; }
+    macro_rules! a4 { () => { while v.len() % 4 != 0 { v.push(0u8); } }; }
+
+    let dlg_style: u32 = 0x40 | 0x80 | 0x0800 | 0x80000000 | 0x00C00000 | 0x00080000;
+    dw!(dlg_style); dw!(0u32);
+    w!(4u16);
+    sw!(0); sw!(0); sw!(240); sw!(64);
+    w!(0u16); w!(0u16);
+    ws!("GitHub Token");
+    w!(9u16); ws!("Segoe UI");
+    a4!();
+
+    dw!(0x10000000u32 | 0x40000000u32); dw!(0u32);
+    sw!(7); sw!(7); sw!(226); sw!(9); w!(100u16);
+    w!(0xFFFFu16); w!(0x0082u16); ws!("Enter GitHub Personal Access Token:"); w!(0u16); a4!();
+
+    dw!(0x10000000u32 | 0x40000000u32 | 0x00800000u32 | 0x00010000u32 | 0x0080u32); dw!(0u32);
+    sw!(7); sw!(19); sw!(226); sw!(14); w!(101u16);
+    w!(0xFFFFu16); w!(0x0081u16); ws!(""); w!(0u16); a4!();
+
+    dw!(0x10000000u32 | 0x40000000u32 | 0x00010000u32 | 0x01u32); dw!(0u32);
+    sw!(130); sw!(44); sw!(50); sw!(14); w!(1u16);
+    w!(0xFFFFu16); w!(0x0080u16); ws!("OK"); w!(0u16); a4!();
+
+    dw!(0x10000000u32 | 0x40000000u32 | 0x00010000u32); dw!(0u32);
+    sw!(186); sw!(44); sw!(50); sw!(14); w!(2u16);
+    w!(0xFFFFu16); w!(0x0080u16); ws!("Cancel"); w!(0u16);
+
+    v
+}
+
+unsafe extern "system" fn token_dlg_proc(
+    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, lparam.0 as isize);
+            1
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u16;
+            if id == 1 {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Option<String>;
+                if !ptr.is_null() {
+                    if let Ok(hedit) = GetDlgItem(hwnd, 101) {
+                        let mut buf = [0u16; 2048];
+                        let len = SendMessageW(
+                            hedit, WM_GETTEXT,
+                            WPARAM(buf.len()), LPARAM(buf.as_mut_ptr() as isize),
+                        ).0 as usize;
+                        if len > 0 {
+                            let tok = String::from_utf16_lossy(&buf[..len]).trim().to_string();
+                            if !tok.is_empty() { *ptr = Some(tok); }
+                        }
+                    }
+                }
+                let _ = EndDialog(hwnd, 1);
+                1
+            } else if id == 2 {
+                let _ = EndDialog(hwnd, 0);
+                1
+            } else { 0 }
+        }
+        WM_CLOSE => { let _ = EndDialog(hwnd, 0); 1 }
+        _ => 0,
+    }
+}
+
+fn show_token_dialog(parent: HWND) -> Option<String> {
+    let tmpl = build_token_dialog_template();
+    let mut result: Option<String> = None;
+    unsafe {
+        DialogBoxIndirectParamW(
+            None,
+            tmpl.as_ptr() as *const DLGTEMPLATE,
+            parent,
+            Some(token_dlg_proc),
+            LPARAM(&mut result as *mut Option<String> as isize),
+        );
+    }
+    result
 }

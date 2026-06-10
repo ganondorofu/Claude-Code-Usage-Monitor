@@ -18,11 +18,13 @@ pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
+pub const TIMER_COPILOT_POLL: usize = 5;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
 pub const WM_APP_USAGE_UPDATED: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
+pub const WM_APP_COPILOT_UPDATED: u32 = WM_APP + 4;
 
 /// Get the taskbar window handle
 pub fn find_taskbar() -> Option<HWND> {
